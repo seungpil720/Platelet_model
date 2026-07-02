@@ -72,6 +72,5 @@ The script maps the following raw variables to standardized targets:
 
 ## Notes
 
-- Figure 1(C) excludes `surg_local_today` and shows total platelet issue plus hematology-oncology activity.
 - The inventory trade-off legend uses full labels: `PC: platelet concentrate` and `APC: apheresis platelet concentrates`.
 - Inventory simulation is a simplified decision-support model, not a complete representation of real-world blood-bank operations.
