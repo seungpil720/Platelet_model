@@ -7,6 +7,79 @@ Platelet demand forecasting, inventory-policy simulation, and manuscript
 table/figure generation -- the pipeline that actually produced the tables
 and figures in the submitted manuscript revision.
 
+CORRECTED, round 1 (see fit_lasso_ridge_models() and
+simulate_inventory_policy() below, still present in this round), to bring
+this script in line with the primary analysis and with Supplementary
+Methods S1.14/S1.15:
+  1. fit_lasso_ridge_models() previously fit LassoCV/RidgeCV (time-series
+     cross-validated penalty selection). The primary analysis, and the
+     current Table 2/3/4/Supplementary Table S6 numbers in the manuscript,
+     use a single FIXED, prespecified penalty (LASSO alpha=0.05; Ridge
+     alpha=5.0) instead -- no LassoCV/RidgeCV is used anywhere in the
+     current primary analysis. This script's Figure 2 (plot_figure3_target_
+     forecast_grid) and Supplementary Figure S1 (plot_figure2_product_
+     forecast) both overlay a "LASSO forecast" line built from this
+     function's output, so the LassoCV version made those two figures show
+     a materially different (visibly more smoothed/regularized) forecast
+     line than the fixed-alpha LASSO described in the text and used
+     everywhere else. Re-running this script now reproduces the fixed-alpha
+     forecast consistently in the figures as well as the tables.
+  2. simulate_inventory_policy() previously used float on-hand inventory
+     with an implicit floor/round; it now uses the same integer,
+     age-structured, ceiling-based engine (with a per-day integer
+     mass-balance assert) described in Supplementary Methods S1.15 and
+     already used elsewhere in the primary analysis, so this script's own
+     Table 3/Table 4/Supplementary Figure S2 outputs match that engine too.
+
+CORRECTED, round 2 (this revision): unifies this script's forecasting
+engine with platelet_forecast_inventory.py, the clean public-repo script
+(see GitHub_cleanup_instructions.md), instead of each script maintaining
+its own, separately-written feature engineering. Specifically:
+  3. build_feature_matrix() has been replaced by build_feature_frame(),
+     ported directly from platelet_forecast_inventory.py's build_feature_
+     frame() (calendar features + per-target lag1/lag7/ma7/ma14 + every
+     other numeric column lagged by 1 day, with no constant-column filter).
+     LASSO, Ridge, LightGBM, and SARIMA's underlying regression features
+     (all but SARIMA, which is univariate) now all share exactly this one
+     predictor set, so there is a single feature-engineering implementation
+     in this project's manuscript pipeline instead of two that could drift
+     apart -- this was the direct cause of the residual Table 2/3
+     divergence found after round 1's alpha/inventory-engine fixes.
+  4. Together with (3), fit_lasso_ridge_models(), fit_lightgbm_models(),
+     and make_baseline_predictions() now all use platelet_forecast_
+     inventory.py's forecast-ORIGIN-date convention: a prediction row's own
+     date is the date features were built from (data up to that date, via
+     the internal 1-day lags), and its forecast target is HORIZON=1 day
+     later. Because every downstream manuscript table/figure function in
+     this script expects predictions indexed by the TARGET (actual) date,
+     each of these three functions relabels its own output with a
+     "+HORIZON days" shift immediately after fitting/predicting --
+     build_origin_index() / the "target_dates = origin_index + HORIZON"
+     pattern below -- the same date-alignment shift already used earlier in
+     this project to build the authoritative fixed-alpha
+     pred_long_test.csv consumed by Figure 2 and Supplementary Figure S1.
+     SARIMA is left as in round 1: it is already a genuine multi-step
+     univariate forecast produced directly for the calendar dates
+     immediately following its training window, so it needs no shift.
+  5. make_lasso()/make_ridge() (Pipeline builders) and the LASSO/Ridge
+     penalty values are otherwise unchanged from round 1 (still LASSO
+     alpha=0.05, Ridge alpha=5.0, no LassoCV/RidgeCV); simulate_inventory_
+     policy() is unchanged from round 1 -- it already implements the same
+     integer/age-structured/ceiling engine as platelet_forecast_
+     inventory.py's simulate_inventory(), so there was nothing left to
+     unify there.
+  Net effect: this script's own from-scratch Table 2/3/4 refit should now
+  track platelet_forecast_inventory.py's (already end-to-end-verified-
+  against-real-data) forecasts and inventory outcomes far more closely than
+  the round-1 version did, since both scripts now build predictors the same
+  way and evaluate them with the same origin/target date handling. Some
+  residual numeric divergence from the *published* Table 2/3/4 is still
+  expected and disclosed elsewhere (Supplement S1.14, GitHub_cleanup_
+  instructions.md): the primary analysis itself was run with the full
+  ~169-predictor set from platelet_analysis_v2.py, which is more extensive
+  than the illustrative predictor set ported here from the public-repo
+  script.
+
 Why this version replaces the previous merge
 ----------------------------------------------
 An earlier draft of this "final" script was built around
@@ -24,7 +97,11 @@ This script is therefore built from platelet_figures_20260702.py instead,
 cleaned up the same way: Colab-only code removed, duplicate function
 definitions resolved, and a single argparse-driven main() added. The
 sparse-hurdle/LightGBM/Prophet/LSTM script is intentionally NOT included
-here, since it was not part of what was submitted.
+here, since it was not part of what was submitted. LightGBM and SARIMA
+*are* kept (unlike platelet_forecast_inventory.py, the public-repo script,
+which deliberately excludes them by scope -- see that script's own module
+docstring), because Table 2 as currently published still reports all ten
+models.
 
 Figure and table numbering
 ---------------------------
@@ -92,9 +169,24 @@ import matplotlib.pyplot as plt
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LassoCV, RidgeCV
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.linear_model import Lasso, Ridge
 from sklearn.metrics import f1_score
+
+# Fixed, prespecified penalty parameters for the primary analysis (see
+# Supplementary Methods S1.14). No cross-validated (LassoCV/RidgeCV) penalty
+# selection is used anywhere in the primary analysis.
+LASSO_ALPHA = 0.05
+RIDGE_ALPHA = 5.0
+RANDOM_STATE = 42
+
+# Forecast horizon and feature-engineering constants, ported from
+# platelet_forecast_inventory.py's Config (max_horizon=1, moving_windows=
+# (7, 14), seasonal_period=7). HORIZON=1 means every prediction row is a
+# next-day (h=1) forecast, matching the prespecified primary-analysis
+# horizon described in the Methods.
+HORIZON = 1
+MOVING_WINDOWS = (7, 14)
+SEASONAL_PERIOD = 7
 
 
 try:
@@ -346,132 +438,173 @@ def classify_demand_pattern(adi, cv2):
     return "lumpy"
 
 
-def build_feature_matrix(df, target_cols):
-    """
-    Leakage-safe feature matrix.
+def make_calendar_features(index):
+    """Ported verbatim from platelet_forecast_inventory.py's
+    make_calendar_features()."""
+    cal = pd.DataFrame(index=index)
+    cal["dow"] = index.dayofweek
+    cal["is_weekend"] = (index.dayofweek >= 5).astype(int)
+    cal["month"] = index.month
+    cal["quarter"] = index.quarter
+    cal["dayofyear_sin"] = np.sin(2 * np.pi * index.dayofyear / 365.25)
+    cal["dayofyear_cos"] = np.cos(2 * np.pi * index.dayofyear / 365.25)
+    return cal
 
-    - Target autoregressive features use lagged values only.
-    - All non-target numeric variables are lagged by 1 day.
-    - Calendar features are same-day deterministic variables.
-    """
 
-    blocks = []
-
-    # Autoregressive target features
-    ar_parts = {}
+def build_feature_frame(df, target_cols, windows=MOVING_WINDOWS):
+    """Leakage-safe feature matrix, ported verbatim from platelet_forecast_
+    inventory.py's build_feature_frame() -- the public-repo script's
+    already-tested feature engineering -- so that LASSO, Ridge, LightGBM,
+    and (indirectly) the blends in this manuscript pipeline all now share
+    exactly one predictor set instead of each script maintaining its own,
+    divergent implementation (this replaces the earlier build_feature_
+    matrix()). All predictors are lagged relative to the forecast ORIGIN
+    date, so no same-day or future information leaks into the horizon-h
+    forecast."""
+    features = make_calendar_features(df.index)
     for t in target_cols:
-        ar_parts[f"{t}_lag1"] = df[t].shift(1)
-        ar_parts[f"{t}_lag7"] = df[t].shift(7)
-        ar_parts[f"{t}_ma7"] = df[t].shift(1).rolling(7, min_periods=2).mean()
-        ar_parts[f"{t}_ma14"] = df[t].shift(1).rolling(14, min_periods=3).mean()
-        ar_parts[f"{t}_ma30"] = df[t].shift(1).rolling(30, min_periods=7).mean()
+        features[f"{t}_lag1"] = df[t].shift(1)
+        features[f"{t}_lag7"] = df[t].shift(7)
+        for w in windows:
+            features[f"{t}_ma{w}"] = df[t].shift(1).rolling(w, min_periods=2).mean()
 
-    blocks.append(pd.DataFrame(ar_parts, index=df.index))
+    numeric_cols = df.select_dtypes(include=[np.number]).columns
+    non_targets = [c for c in numeric_cols if c not in target_cols]
+    lagged = df[non_targets].shift(1)
+    lagged.columns = [f"{c}_lag1" for c in non_targets]
+    features = pd.concat([features, lagged], axis=1)
+    features = features.replace([np.inf, -np.inf], np.nan)
 
-    # Calendar features
-    cal = pd.DataFrame(index=df.index)
-    cal["dow"] = df.index.dayofweek
-    cal["dow_fri"] = (df.index.dayofweek == 4).astype(int)
-    cal["is_weekend"] = (df.index.dayofweek >= 5).astype(int)
-    cal["month"] = df.index.month
-    cal["quarter"] = df.index.quarter
-    cal["dayofyear_sin"] = np.sin(2 * np.pi * df.index.dayofyear / 365.25)
-    cal["dayofyear_cos"] = np.cos(2 * np.pi * df.index.dayofyear / 365.25)
-    blocks.append(cal)
+    return features
 
-    # Exogenous numeric variables, lagged by 1 day
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    exog_cols = [c for c in numeric_cols if c not in target_cols]
 
-    exog = df[exog_cols].copy()
-    exog = exog.loc[:, exog.nunique(dropna=True) > 1]
-    exog = exog.shift(1)
-    exog.columns = [f"{c}_lag1" for c in exog.columns]
-    blocks.append(exog)
+def build_origin_index(target_index, horizon=HORIZON):
+    """Given a TARGET-date index (e.g. validation_df.index or test_df.index,
+    the dates a prediction is actually FOR), return the corresponding
+    forecast-ORIGIN-date index used internally by build_feature_frame()/
+    platelet_forecast_inventory.py: origin = target - horizon days. A
+    prediction fit/evaluated at an origin date uses only data up to that
+    origin date (via the 1-day-lagged features above), and its forecast
+    target is `horizon` days later -- see the module docstring's round-2
+    notes and platelet_forecast_inventory.py's build_feature_frame()/
+    target_series_for_horizon()."""
+    return pd.DatetimeIndex(pd.to_datetime(target_index)) - pd.Timedelta(days=horizon)
 
-    X = pd.concat(blocks, axis=1)
-    X = X.copy()
 
-    return X
+def rolling_forecast_series(y_full, eval_index, horizon, window):
+    """Ported verbatim from platelet_forecast_inventory.py."""
+    ma = y_full.shift(horizon).rolling(window, min_periods=2).mean()
+    return ma.reindex(eval_index)
+
+
+def seasonal_naive_forecast(y_full, eval_index, horizon, seasonal_period=SEASONAL_PERIOD):
+    """Ported verbatim from platelet_forecast_inventory.py."""
+    lag = horizon + seasonal_period - (horizon % seasonal_period if horizon % seasonal_period else 0)
+    return y_full.shift(lag).reindex(eval_index)
+
+
+def make_lasso(alpha, random_state):
+    """Ported verbatim from platelet_forecast_inventory.py's make_lasso()."""
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", Lasso(alpha=alpha, max_iter=1000, tol=1e-3, selection="random", random_state=random_state)),
+    ])
+
+
+def make_ridge(alpha):
+    """Ported verbatim from platelet_forecast_inventory.py's make_ridge()."""
+    return Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+        ("model", Ridge(alpha=alpha)),
+    ])
 
 
 def make_baseline_predictions(df, train_index, pred_index, target_cols):
+    """Historical mean, seasonal-naive, MA7, and MA14 baselines, ported from
+    platelet_forecast_inventory.py's rolling_forecast_series()/
+    seasonal_naive_forecast(), evaluated at the forecast ORIGIN date and then
+    relabeled to the target date (origin + HORIZON days) -- the same origin/
+    target convention now shared by every model in this pipeline (see
+    fit_lasso_ridge_models() and fit_lightgbm_models() below)."""
+    origin_pred_index = build_origin_index(pred_index)
+    target_dates = origin_pred_index + pd.Timedelta(days=HORIZON)
+
     pred_rows = []
 
     for target in target_cols:
         full_y = pd.to_numeric(df[target], errors="coerce").fillna(0)
-        train_y = full_y.loc[train_index]
-        hist_mean = train_y.mean()
+        train_y_actual = full_y.reindex(train_index)
+        hist_mean = train_y_actual.mean()
 
         pred_map = {
-            "Historical mean": pd.Series(hist_mean, index=pred_index),
-            "Seasonal naive": full_y.shift(7).reindex(pred_index),
-            "MA7": full_y.shift(1).rolling(7, min_periods=2).mean().reindex(pred_index),
-            "MA14": full_y.shift(1).rolling(14, min_periods=3).mean().reindex(pred_index),
+            "Historical mean": pd.Series(hist_mean, index=origin_pred_index),
+            "Seasonal naive": seasonal_naive_forecast(full_y, origin_pred_index, HORIZON, SEASONAL_PERIOD),
+            "MA7": rolling_forecast_series(full_y, origin_pred_index, HORIZON, 7),
+            "MA14": rolling_forecast_series(full_y, origin_pred_index, HORIZON, 14),
         }
 
-        y_true = full_y.reindex(pred_index)
+        y_true = full_y.reindex(target_dates)
 
         for model_name, pred in pred_map.items():
-            pred = pred.fillna(hist_mean).clip(lower=0)
+            pred = pd.Series(pred).reindex(origin_pred_index).fillna(hist_mean).clip(lower=0)
 
-            for date in pred_index:
+            for date, yt, yp in zip(target_dates, y_true.values, pred.values):
                 pred_rows.append({
                     "date": date,
                     "target": target,
                     "model": model_name,
-                    "y_true": y_true.loc[date],
-                    "y_pred": pred.loc[date],
+                    "y_true": yt,
+                    "y_pred": yp,
                 })
 
     return pd.DataFrame(pred_rows)
 
 
 def fit_lasso_ridge_models(df, train_index, pred_index, target_cols):
-    X_all = build_feature_matrix(df, target_cols)
+    """LASSO and Ridge forecasts, ported from platelet_forecast_inventory.py's
+    forecast_target(): the fixed penalty (LASSO alpha=0.05; Ridge alpha=5.0)
+    and build_feature_frame() features, fit/evaluated at the forecast ORIGIN
+    date. Predictions are relabeled with a "+HORIZON days" shift immediately
+    after predicting, so the returned rows are indexed by the TARGET (actual)
+    date expected by every downstream manuscript table/figure function --
+    the same date-alignment shift already used earlier in this project to
+    build the authoritative fixed-alpha pred_long_test.csv consumed by
+    Figure 2 and Supplementary Figure S1."""
+    X_all = build_feature_frame(df, target_cols)
+
+    origin_train_index = build_origin_index(train_index)
+    origin_pred_index = build_origin_index(pred_index)
+    target_dates = origin_pred_index + pd.Timedelta(days=HORIZON)
 
     pred_rows = []
     coef_rows = []
 
-    lasso_alphas = np.logspace(-4, 1, 50)
-    ridge_alphas = np.logspace(-3, 3, 40)
-
     for target in target_cols:
-        y_all = pd.to_numeric(df[target], errors="coerce").fillna(0)
+        y_all = df[target].shift(-HORIZON)  # origin-indexed: value HORIZON day(s) later
 
-        X_train = X_all.loc[train_index]
-        y_train = y_all.loc[train_index]
-
-        X_pred = X_all.loc[pred_index]
-        y_true = y_all.loc[pred_index]
+        X_train = X_all.reindex(origin_train_index)
+        y_train = y_all.reindex(origin_train_index)
 
         valid_rows = y_train.notna()
         X_train = X_train.loc[valid_rows]
-        y_train = y_train.loc[valid_rows]
+        y_train = y_train.loc[valid_rows].astype(float)
+
+        X_pred = X_all.reindex(origin_pred_index)
+        y_true = y_all.reindex(origin_pred_index)
 
         if len(y_train) < 60:
             warnings.warn(f"Too few training rows for {target}; skipping LASSO/Ridge.")
             continue
 
-        n_splits = min(5, max(2, len(y_train) // 300))
-        tscv = TimeSeriesSplit(n_splits=n_splits)
-
+        # Fixed, prespecified penalty (see Supplementary Methods S1.14): no
+        # validation- or test-period outcomes are used to choose these
+        # values, and no LassoCV/RidgeCV cross-validated selection is
+        # performed anywhere in the primary analysis.
         models = {
-            "LASSO": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("model", LassoCV(
-                    alphas=lasso_alphas,
-                    cv=tscv,
-                    max_iter=30000,
-                    random_state=42
-                )),
-            ]),
-            "Ridge": Pipeline([
-                ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
-                ("model", RidgeCV(alphas=ridge_alphas)),
-            ]),
+            "LASSO": make_lasso(LASSO_ALPHA, RANDOM_STATE),
+            "Ridge": make_ridge(RIDGE_ALPHA),
         }
 
         for model_name, pipe in models.items():
@@ -479,7 +612,7 @@ def fit_lasso_ridge_models(df, train_index, pred_index, target_cols):
             pred = pipe.predict(X_pred)
             pred = np.clip(pred, 0, None)
 
-            for date, yt, yp in zip(pred_index, y_true.values, pred):
+            for date, yt, yp in zip(target_dates, y_true.values, pred):
                 pred_rows.append({
                     "date": date,
                     "target": target,
@@ -501,21 +634,33 @@ def fit_lasso_ridge_models(df, train_index, pred_index, target_cols):
 
 
 def fit_lightgbm_models(df, train_index, pred_index, target_cols):
+    """LightGBM forecasts, kept in the model roster (Table 2 currently
+    reports it), but now built from the same build_feature_frame() features
+    and origin/target date convention as LASSO/Ridge above, instead of the
+    earlier, separately-engineered build_feature_matrix()."""
     if not HAS_LIGHTGBM:
         print("LightGBM is not installed. Skipping LightGBM.")
         return pd.DataFrame()
 
-    X_all = build_feature_matrix(df, target_cols)
+    X_all = build_feature_frame(df, target_cols)
+
+    origin_train_index = build_origin_index(train_index)
+    origin_pred_index = build_origin_index(pred_index)
+    target_dates = origin_pred_index + pd.Timedelta(days=HORIZON)
+
     pred_rows = []
 
     for target in target_cols:
-        y_all = pd.to_numeric(df[target], errors="coerce").fillna(0)
+        y_all = df[target].shift(-HORIZON)
 
-        X_train = X_all.loc[train_index]
-        y_train = y_all.loc[train_index]
+        X_train = X_all.reindex(origin_train_index)
+        y_train = y_all.reindex(origin_train_index)
+        valid_rows = y_train.notna()
+        X_train = X_train.loc[valid_rows]
+        y_train = y_train.loc[valid_rows]
 
-        X_pred = X_all.loc[pred_index]
-        y_true = y_all.loc[pred_index]
+        X_pred = X_all.reindex(origin_pred_index)
+        y_true = y_all.reindex(origin_pred_index)
 
         imputer = SimpleImputer(strategy="median")
         X_train_imp = imputer.fit_transform(X_train)
@@ -535,7 +680,7 @@ def fit_lightgbm_models(df, train_index, pred_index, target_cols):
         pred = model.predict(X_pred_imp)
         pred = np.clip(pred, 0, None)
 
-        for date, yt, yp in zip(pred_index, y_true.values, pred):
+        for date, yt, yp in zip(target_dates, y_true.values, pred):
             pred_rows.append({
                 "date": date,
                 "target": target,
@@ -551,6 +696,13 @@ def fit_sarima_models(df, train_index, pred_index, target_cols):
     """
     Optional SARIMA model.
     Some sparse targets may fail; failures are skipped.
+
+    Unlike the other models above, SARIMA is a genuine multi-step univariate
+    forecast: res.forecast(steps=len(pred_index)) already produces one value
+    per calendar day immediately following the end of train_index, which is
+    exactly pred_index (train_index and pred_index are contiguous, non-
+    overlapping windows -- see split_train_validation_test()). It therefore
+    needs no origin/target date shift and is left as in round 1.
     """
     if not HAS_STATSMODELS:
         print("statsmodels is not installed. Skipping SARIMA.")
@@ -910,6 +1062,13 @@ def make_platelet_strata_table(lasso_coef, df):
     return pd.DataFrame(rows)
 
 
+def _as_int_units(x: float) -> int:
+    """Round to the nearest whole unit, never negative (Supplementary Methods S1.15)."""
+    if x is None or not np.isfinite(float(x)):
+        return 0
+    return max(0, int(round(float(x))))
+
+
 def simulate_inventory_policy(
     demand,
     forecast,
@@ -920,34 +1079,40 @@ def simulate_inventory_policy(
     shortage_cost=SHORTAGE_COST,
     wastage_cost=WASTAGE_COST,
 ):
+    """Integer, age-structured, order-up-to inventory simulation (Supplementary
+    Methods S1.15). Unchanged from round 1: this already implements the same
+    algorithm as platelet_forecast_inventory.py's simulate_inventory() (whole-
+    unit on-hand inventory, ceiling-rounded orders, per-day integer mass-
+    balance assert, every placed order counted toward total_procured even if
+    its arrival falls beyond the simulated window), so there was nothing left
+    to unify here in round 2 -- only the parameter names differ (target_
+    days_supply/safety_factor/shelf_life_days/delivery_lag_days here vs.
+    lead_time_days there) to match this script's existing table functions."""
     demand = pd.Series(demand).fillna(0).clip(lower=0)
     forecast = pd.Series(forecast).reindex(demand.index).ffill().bfill().fillna(0).clip(lower=0)
 
     dates = demand.index
     n = len(dates)
 
-    inventory = np.zeros(shelf_life_days)
-    inventory[-1] = forecast.iloc[0] * target_days_supply * safety_factor
+    inventory = [0 for _ in range(shelf_life_days)]
+    inventory[-1] = _as_int_units(forecast.iloc[0] * target_days_supply * safety_factor)
 
     pending = {}
 
     logs = []
-    total_demand = 0.0
-    total_procured = 0.0
-    total_fulfilled = 0.0
-    total_unmet = 0.0
-    total_wasted = 0.0
+    total_demand = total_procured = total_fulfilled = total_unmet = total_wasted = 0
 
     for i, date in enumerate(dates):
+        opening = sum(inventory)
 
         # Receive orders
-        received_today = pending.pop(i, 0.0)
+        received_today = int(pending.pop(i, 0))
         inventory[-1] += received_today
 
         # Fulfill demand FIFO
-        d = float(demand.iloc[i])
+        d = _as_int_units(demand.iloc[i])
         remaining = d
-        fulfilled = 0.0
+        fulfilled = 0
 
         for bucket in range(shelf_life_days):
             use = min(inventory[bucket], remaining)
@@ -961,24 +1126,32 @@ def simulate_inventory_policy(
         unmet = remaining
 
         # Expiration and aging
-        wasted_today = inventory[0]
+        wasted_today = int(inventory[0])
         inventory[:-1] = inventory[1:]
-        inventory[-1] = 0.0
+        inventory[-1] = 0
 
         # Order for future
         future_i = min(i + delivery_lag_days, n - 1)
         future_forecast = float(forecast.iloc[future_i])
 
         target_inventory = target_days_supply * future_forecast * safety_factor
-        on_hand = inventory.sum()
-        pending_qty = sum(pending.values())
+        on_hand = int(sum(inventory))
+        pending_qty = int(sum(pending.values()))
 
+        # Ceiling applied to the whole gap, not to each term separately.
         order_qty = max(0, math.ceil(target_inventory - on_hand - pending_qty))
 
+        if order_qty > 0:
+            total_procured += order_qty
         arrival_i = i + delivery_lag_days
         if arrival_i < n and order_qty > 0:
-            pending[arrival_i] = pending.get(arrival_i, 0.0) + order_qty
-            total_procured += order_qty
+            pending[arrival_i] = pending.get(arrival_i, 0) + order_qty
+
+        closing = int(sum(inventory))
+        assert opening + received_today == fulfilled + wasted_today + closing, (
+            f"Mass-balance violation on {date}: opening={opening} received={received_today} "
+            f"fulfilled={fulfilled} wasted={wasted_today} closing={closing}"
+        )
 
         total_demand += d
         total_fulfilled += fulfilled
@@ -994,7 +1167,7 @@ def simulate_inventory_policy(
             "unmet": unmet,
             "wasted": wasted_today,
             "order_qty": order_qty,
-            "ending_inventory": inventory.sum(),
+            "ending_inventory": closing,
         })
 
     service_level = total_fulfilled / total_demand * 100 if total_demand > 0 else np.nan
